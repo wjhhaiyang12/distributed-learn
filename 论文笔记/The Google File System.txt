@@ -1,0 +1,103 @@
+1. 分布式系统中，机器/组件故障是常见的事情，而不是异常。所以一个分布式的文件系统，必须考虑监控、故障发现、故障容忍、自动故障恢复。
+
+2. 存在GB大小的单个文件，或者几百万个KB大小的文件。所以I/O操作和block size都需要重点考虑。
+
+3. 大部分场景都是新数据的写入，老数据更新的场景极少。比如归档数据、大规模的监控埋点数据等。这些数据写入以后就不会改变了，文件写入后只能读取。所以追加文件的性能是最重要的。
+
+4. 设计一个分布式文件系统的前提与需求：
+   a.系统建立在很多便宜的，经常会故障的设备上。所以监控，容错，故障恢复都非常重要。
+   b.系统需要存储大量大文件，可能会有100万个超过100MB的文件，GB大小的文件也会很常见。
+   c.要支持两种读取方式，大型流式读取和小型随机读取。分别是一个操作读取1MB的数据，以及随机地读取几KB的数据。
+   d.写入方式主要是在大文件的末尾追加1MB的数据；随机更新也要支持，但不需要高性能。
+   e.需要支持并发读写同一个文件。
+   f.高带宽比低延迟更重要。设计的目标是支持大规模数据批处理的场景，不是对延迟有要求的读写。
+
+5. 提供文件系统通用的API：create, delete, open, close, read, write, snapshot, record append
+   snapshot: 创建文件/文件夹的快照
+   record append: 支持多个客户端并发地在同一个文件的末尾追加数据
+   write: 在文件的指定offset处写入文件
+
+6. GFS由一个master，多个chunkservers，以及多个访问GFS的client构成。
+
+7. 文件被分割成多个chunk，存储在chunkserver的本地文件系统里。为了数据可靠性，一个chunk默认会保存三个副本。
+
+8. master存储metadata，包括文件到chunk的映射，chunkserver的列表。
+   master负责chunk管理，废弃chunk回收，chunk合并操作。
+   master通过定时的心跳，维护chunkserver的状态，向chunkserver发送指令。
+
+9. chunkserver不会显示地缓存任何文件数据，因为大部分文件都非常大，而且可以使用文件系统自身的缓存。
+
+10. client先从master获取file对应的chunk的位置，再去chunkserver请求数据。
+
+11. ChunkSize选择了64MB，比传统文件系统的blockSize要大很多。较大的ChunkSize有这些好处: 
+    a.减少了client和master的通信，大部分场景client会顺序地读写大文件，只需要操作一个chunk即可。
+    b.client只需要访问一个chunk和一个chunkserver，可以通过维持TCP长连接来减少网络开销。
+    c.更少的chunk，可以减少master上存储的metadata的数据量，使得metadata可以保存在内存里。
+
+12. metadata包含三类数据: 文件名+chunk名、文件到chunk的映射关系、chunk的位置
+    前两种数据会通过操作日志的方式，持久化到master的本地磁盘上。
+    chunk位置数据没有持久化，会在master启动的时候主动去chunkserver获取，然后定期更新。
+
+13. operationLog对系统非常重要，所以不仅会持久化到本地文件，还会同步备份到其它服务器上。对metadata的修改，只有当本地和远程备份都更新成功operationLog后，才算是成功。
+
+14. operationLog增长到特定容量后，master会触发checkpoint，保存当前的状态数据。后续master的故障恢复，从最新的checkpoint开始，再以此执行后续的operationLog，就能恢复到最新的状态了。
+
+15. 文件的概念描述：
+    consistent: 所有的client都能看到相同的数据，无论他们读的是哪一个副本。
+    defined: 所有的client都能看到相同的数据，并且能看到操作对数据的完成的修改。
+
+16. 当一个串行(write)的写入成功了，它影响的数据范围是defined的。所有client都能看到相同的数据和完整的修改。
+    当一个并行(record append)的写入成功了，它影响的数据范围是undefined且consistent的。所有client都能看到相同的数据，但不一定包含了这次写入的完整内容。
+    当一个写入失败了，它影响的数据范围是inconsistent的，不同的client会看到不同的数据。
+
+17. 每个chunk副本都会按相同的顺序来执行操作，确保defined和consistent。
+
+18. 引入chunk version number来区分是否有副本的数据是过期的，比如某个副本遗漏了在chunkserver故障期间的发生的操作。
+    过期的chunk副本不会再被修改，他们会尽快地被垃圾回收处理掉。
+    client会缓存文件对应chunks的位置，如果出现了过期的chunk，需要重新和master通信，才能拿到正确的数据。
+
+19. master通过和chunkserver定期握手来发现故障；使用checksum来检测数据是否有缺损。
+
+20. write操作的流程：
+    a.client请求master，获取file对应的chunk，以及每个chunk副本所在的chunkserver
+    b.master会指定其中一个chunk为primary，给他发放一个持续60秒的租约
+    c.client会缓存这部分路由的数据，直到primary的租约过期，或者primary不可用
+    d.client把要写入的数据，提前传给所有副本，要写入的数据会保存在chunkserver的内存里。
+    e.client通知primary执行写入
+    f.primary根据这段时间收到的写入指令，分配执行顺序编号，依次执行写入
+    g.primary把执行顺序编号传递给其它副本，按同样的顺序在其它副本上执行写入
+    h.primary返回执行结果给client，包含是否有副本执行失败的错误信息
+
+21. 为了让步骤d的数据传输更快，数据会按照chunkserver之间的距离，在chunkserver之间线性传播。
+    a.client寻找离他最近的chunkserverA传递数据。
+    b.chunkserverA一边接收数据，一边寻找离他最新的chunkserverB传递数据。
+    c.chunkserverB一边接收数据，一边寻找离他最新的chunkserverC传递数据。
+    d.数据的接收和传递时同时开始的，A不需要等到数据全部接收完，再开始传递数据给B。
+    e.这样的方案可以充分利用每一台机器的带宽，让传输过程更快。
+    f.理论上B bytes的数据，传输到R个副本上，需要B/T + R*L的时间。其中T是带宽速度，L是两个副本之间传递数据的延迟时间。
+
+22. 如果一次write操作会横跨多个chunk，Client会把他切割成多个小的write操作后再执行。
+
+23. 多个client并发地write同一块数据，会因为相互覆盖导致出现数据碎片。使用record append可以保证写入至少执行一次，以及写入操作的原子性。
+
+24. record append的执行逻辑和write的区别不大。
+    a.primary会自己选择当前文件末尾的offset，并将offset通知给其它副本。
+    b.GFS确保数据会在chunk上至少写入一次。并且数据写入一定是原子性的，不会出现并发相互覆盖的情况。
+
+25. snapshot指令使用了copy-on-write的实现方案。
+    a.master会先废除所有对应chunk的租约。
+    b.执行snapshot指令时，只是在master上复制一份文件名和映射关系，源文件和复制文件共用同一份chunk。
+    c.在对复制的文件进行写入时，master才会通知各个chunkserver，在本地复制一份对应的chunk，给复制的文件使用。
+
+26. 文件和文件夹数据在GFS里是平铺存储的，不是像传统的文件系统组织成分层的形式。所以GFS不支持列出文件夹里的所有文件。
+
+27. 在master里，每一个文件和文件夹都有一把读锁和一把写锁，来支持多个用户的并行操作。
+    a.为/home/user执行snapshot，需要/home的读锁，以及/home/user的写锁
+    b.创建/home/user/foo文件，需要/home和/home/user的读锁，以及/home/user/foo的写锁
+    c.上述的snapshot和create操作会串行执行，因为他们在/home/user的锁上有冲突，获取写锁必须等所有读锁释放，获取读锁也必须等写锁释放
+
+28. 
+
+    
+
+
